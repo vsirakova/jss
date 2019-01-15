@@ -60,5 +60,5 @@ export interface ProxyConfig {
     request: ClientRequest,
     response: ServerResponse,
     proxyResponse: IncomingMessage
-  ) => Promise<any>;
+  ) => Promise<object>;
 }

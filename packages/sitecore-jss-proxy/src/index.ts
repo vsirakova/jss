@@ -1,5 +1,7 @@
+import { EventEmitter } from 'events';
 import { ClientRequest, IncomingMessage, ServerResponse } from 'http';
 import proxy from 'http-proxy-middleware';
+import httpProxyWebOutgoing from 'http-proxy/lib/http-proxy/passes/web-outgoing';
 import setCookieParser from 'set-cookie-parser';
 import zlib from 'zlib'; // node.js standard lib
 import { AppRenderer } from './AppRenderer';
@@ -7,6 +9,11 @@ import { ProxyConfig } from './ProxyConfig';
 import { RenderResponse } from './RenderResponse';
 import { RouteUrlParser } from './RouteUrlParser';
 import { buildQueryString, tryParseJson } from './util';
+
+// Get all functions exported by the `web-outgoing` module.
+// The methods largely share the same signature, so instead of calling
+// each method by name, we can iterate the array of methods and invoke them "generically".
+const webOutgoingMethods = Object.values(httpProxyWebOutgoing);
 
 // tslint:disable:max-line-length
 
@@ -33,413 +40,224 @@ export const removeEmptyAnalyticsCookie = (proxyResponse: any) => {
   }
 };
 
-// inspired by: http://stackoverflow.com/a/22487927/9324
-async function renderAppToResponse(
+// function replies with HTTP 500 when an error occurs
+async function replyWithError(
+  error: Error,
+  proxyResponse: IncomingMessage,
+  config: ProxyConfig,
+  serverResponse: ServerResponse,
+  emitter: EventEmitter
+) {
+  console.error(error);
+
+  let errorResponse = {
+    statusCode: proxyResponse.statusCode || 500,
+    content: proxyResponse.statusMessage || 'Internal Server Error',
+  };
+
+  if (config.onError) {
+    const onError = await config.onError(error, proxyResponse);
+    errorResponse = { ...errorResponse, ...onError };
+  }
+
+  completeResponse(
+    Buffer.from(errorResponse.content),
+    errorResponse.statusCode,
+    serverResponse,
+    emitter
+  );
+}
+
+function completeResponse(
+  content: Buffer | string,
+  statusCode: number,
+  serverResponse: ServerResponse,
+  emitter: EventEmitter,
+  headers?: any
+) {
+  if (headers) {
+    Object.keys(headers).forEach((headerKey) => {
+      serverResponse.setHeader(headerKey, headers[headerKey]);
+    });
+  }
+
+  // We need the  *byte count* (rather than character count) of the body
+  const contentLength =
+    typeof content === 'string' ? Buffer.byteLength(content) : content.byteLength;
+
+  // setting the content-length header is not absolutely necessary, but is recommended
+  serverResponse.setHeader('content-length', contentLength);
+
+  serverResponse.statusCode = statusCode;
+
+  // give us a chance to do things before the response is written and ended.
+  // note: emit is synchronous and calls listeners synchronously, so any listeners
+  // that are async or perform async operations won't complete before the next tick.
+  emitter.emit('before-response-write');
+
+  serverResponse.write(content);
+
+  serverResponse.end();
+}
+
+async function extractJsonFromResponseData(
+  responseData: Buffer,
+  config: ProxyConfig,
+  statusCode: number | undefined,
+  contentEncoding: string | undefined
+): Promise<object | null> {
+  if (statusCode && (statusCode === 200 || statusCode === 404)) {
+    let responseString: Promise<string>;
+
+    if (
+      contentEncoding &&
+      (contentEncoding.indexOf('gzip') !== -1 || contentEncoding.indexOf('deflate') !== -1)
+    ) {
+      responseString = new Promise((resolve, reject) => {
+        if (config.debug) {
+          console.log('Layout service response is compressed; decompressing.');
+        }
+
+        zlib.unzip(responseData, (error, result) => {
+          if (error) {
+            reject(error);
+          }
+
+          if (result) {
+            resolve(result.toString('utf-8'));
+          }
+        });
+      });
+    } else {
+      responseString = Promise.resolve(responseData.toString('utf-8'));
+    }
+
+    return responseString.then(tryParseJson);
+  }
+
+  return Promise.resolve(null);
+}
+
+async function renderApp(
+  layoutServiceData: any,
   proxyResponse: IncomingMessage,
   request: ClientRequest,
   serverResponse: ServerResponse,
   renderer: AppRenderer,
   config: ProxyConfig
-) {
+): Promise<{ renderingResult: RenderResponse; statusCode: number; headers: any }> {
   if (config.debug) {
     console.log('DEBUG: rendering app');
   }
-  // monkey-patch FTW?
-  const originalWriteHead = serverResponse.writeHead;
-  const originalWrite = serverResponse.write;
-  const originalEnd = serverResponse.end;
 
-  // these lines are necessary and must happen before we do any writing to the response
-  // otherwise the headers will have already been sent
-  delete proxyResponse.headers['content-length'];
-  proxyResponse.headers['content-type'] = 'text/html; charset=utf-8';
+  const viewBag = await createViewBag();
 
-  // remove IIS server header for security
-  delete proxyResponse.headers['server'];
+  return new Promise<{ renderingResult: RenderResponse; statusCode: number; headers: any }>(
+    (resolve, reject) => {
+      // invoke the app renderer, which _should_ invoke the `handleRenderingResult` callback
+      // when the app is done rendering.
+      renderer(handleRenderingResult, (request as any).originalUrl, layoutServiceData, viewBag);
 
-  if (config.setHeaders) {
-    config.setHeaders(request, serverResponse, proxyResponse);
-  }
+      function handleRenderingResult(error: Error | null, renderingResult: RenderResponse | null) {
+        const renderError = determineRenderingError(error, renderingResult);
+        if (renderError) {
+          reject(renderError);
+        }
 
-  const contentEncoding = proxyResponse.headers['content-encoding'];
-  if (
-    contentEncoding &&
-    (contentEncoding.indexOf('gzip') !== -1 || contentEncoding.indexOf('deflate') !== -1)
-  ) {
-    delete proxyResponse.headers['content-encoding'];
-  }
+        // make TS happy since it is unable to infer from `getError` that `result` must be defined at this point.
+        const result = renderingResult as RenderResponse;
 
-  // we are going to set our own status code if rendering fails
-  serverResponse.writeHead = () => {};
+        const headers: any = {
+          'content-type': 'text/html; charset=utf-8',
+        };
 
-  // buffer the response body as it is written for later processing
-  let buf = Buffer.from('');
-  serverResponse.write = (data: any, encoding: any) => {
-    if (Buffer.isBuffer(data)) {
-      buf = Buffer.concat([buf, data]); // append raw buffer
-    } else {
-      buf = Buffer.concat([buf, Buffer.from(data, encoding)]); // append string with optional character encoding (default utf8)
-    }
-
-    // sanity check: if the response is huge, bail.
-    // ...we don't want to let someone bring down the server by filling up all our RAM.
-    if (buf.length > (config.maxResponseSizeBytes as number)) {
-      throw new Error('Document too large');
-    }
-
-    return true;
-  };
-
-  async function extractLayoutServiceDataFromProxyResponse(): Promise<any> {
-    if (proxyResponse.statusCode === 200 || proxyResponse.statusCode === 404) {
-      let responseString: Promise<string>;
-
-      if (
-        contentEncoding &&
-        (contentEncoding.indexOf('gzip') !== -1 || contentEncoding.indexOf('deflate') !== -1)
-      ) {
-        responseString = new Promise((resolve, reject) => {
-          if (config.debug) {
-            console.log('Layout service response is compressed; decompressing.');
+        if (result.redirect) {
+          if (!result.status) {
+            result.status = 302;
           }
 
-          zlib.unzip(buf, (error, result) => {
-            if (error) {
-              reject(error);
-            }
+          headers['location'] = result.redirect;
+        }
 
-            if (result) {
-              resolve(result.toString('utf-8'));
-            }
-          });
+        const finalStatusCode = result.status || proxyResponse.statusCode || 200;
+
+        resolve({
+          renderingResult: result,
+          statusCode: finalStatusCode,
+          headers,
         });
-      } else {
-        responseString = Promise.resolve(buf.toString('utf-8'));
       }
-
-      return responseString.then(tryParseJson);
     }
+  );
 
-    return Promise.resolve(null);
-  }
-
-  // function replies with HTTP 500 when an error occurs
-  async function replyWithError(error: Error) {
-    console.error(error);
-
-    let errorResponse = {
-      statusCode: proxyResponse.statusCode || 500,
-      content: proxyResponse.statusMessage || 'Internal Server Error',
-    };
-
-    if (config.onError) {
-      const onError = await config.onError(error, proxyResponse);
-      errorResponse = { ...errorResponse, ...onError };
-    }
-
-    completeProxyResponse(Buffer.from(errorResponse.content), errorResponse.statusCode, {});
-  }
-
-  // callback handles the result of server-side rendering
-  async function handleRenderingResult(error: Error | null, result: RenderResponse | null) {
+  function determineRenderingError(error: Error | null, result: RenderResponse | null) {
     if (!error && !result) {
-      return replyWithError(new Error('Render function did not return a result or an error!'));
+      return new Error('Render function did not return a result or an error!');
     }
 
     if (error) {
-      return replyWithError(error);
+      return error;
     }
 
     if (!result) {
       // should not occur, but makes TS happy
-      return replyWithError(new Error('Render function result did not return a result.'));
+      return new Error('Render function result did not return a result.');
     }
 
     if (!result.html) {
-      return replyWithError(
-        new Error('Render function result was returned but html property was falsy.')
-      );
+      return new Error('Render function result was returned but html property was falsy.');
     }
 
-    if (config.transformSSRContent) {
-      result.html = await config.transformSSRContent(result, request, serverResponse);
-    }
-
-    // we have to convert back to a buffer so that we can get the *byte count* (rather than character count) of the body
-    const content = Buffer.from(result.html);
-
-    // setting the content-length header is not absolutely necessary, but is recommended
-    proxyResponse.headers['content-length'] = content.length.toString(10);
-
-    if (result.redirect) {
-      if (!result.status) {
-        result.status = 302;
-      }
-
-      proxyResponse.headers['location'] = result.redirect;
-    }
-
-    const finalStatusCode = result.status || proxyResponse.statusCode || 200;
-
-    if (config.debug) {
-      console.log(
-        'DEBUG: FINAL response headers for client',
-        JSON.stringify(proxyResponse.headers, null, 2)
-      );
-
-      console.log('DEBUG: FINAL status code for client', finalStatusCode);
-    }
-
-    completeProxyResponse(content, finalStatusCode);
+    return null;
   }
 
-  function completeProxyResponse(content: Buffer, statusCode: number, headers?: any) {
-    if (!headers) {
-      headers = proxyResponse.headers;
+  async function createViewBag(): Promise<any> {
+    const defaultViewBag = { statusCode: proxyResponse.statusCode, dictionary: {} };
+
+    if (!config.createViewBag) {
+      return defaultViewBag;
     }
 
-    originalWriteHead.apply(serverResponse, [statusCode, headers]);
-    originalWrite.call(serverResponse, content);
-    originalEnd.call(serverResponse, undefined);
+    const customViewBag = await config.createViewBag(
+      request,
+      serverResponse,
+      proxyResponse,
+      layoutServiceData
+    );
+
+    return { ...defaultViewBag, ...customViewBag };
   }
-
-  async function createViewBag(layoutServiceData: any): Promise<any> {
-    let viewBag = {
-      statusCode: proxyResponse.statusCode,
-      dictionary: {},
-    };
-
-    if (config.createViewBag) {
-      const customViewBag = await config.createViewBag(
-        request,
-        serverResponse,
-        proxyResponse,
-        layoutServiceData
-      );
-
-      viewBag = { ...viewBag, ...customViewBag };
-    }
-
-    return viewBag;
-  }
-
-  async function transformLayoutServiceData(layoutServiceData: any): Promise<any> {
-    if (config.transformLayoutServiceData) {
-      return await config.transformLayoutServiceData(
-        layoutServiceData,
-        request,
-        serverResponse,
-        proxyResponse
-      );
-    }
-    return layoutServiceData;
-  }
-
-  // as the response is ending, we parse the current response body which is JSON, then
-  // render the app using that JSON, but return HTML to the final response.
-  serverResponse.end = async () => {
-    try {
-      const extractedLayoutServiceData = await extractLayoutServiceDataFromProxyResponse();
-      const layoutServiceData = await transformLayoutServiceData(extractedLayoutServiceData);
-      const viewBag = await createViewBag(layoutServiceData);
-
-      if (!layoutServiceData) {
-        throw new Error(
-          `Received invalid response ${proxyResponse.statusCode} ${proxyResponse.statusMessage}`
-        );
-      }
-
-      return renderer(
-        handleRenderingResult,
-        (request as any).originalUrl,
-        layoutServiceData,
-        viewBag
-      );
-    } catch (error) {
-      return replyWithError(error);
-    }
-  };
 }
 
-async function transformLayoutServiceResponse(
-  proxyResponse: IncomingMessage,
-  request: any,
-  serverResponse: ServerResponse,
-  config: ProxyConfig
-) {
-  if (config.debug) {
-    console.log(`DEBUG: transforming layout service response for URL: ${request.originalUrl}`);
-  }
-
-  // monkey-patch FTW?
-  const originalWriteHead = serverResponse.writeHead;
-  const originalWrite = serverResponse.write;
-  const originalEnd = serverResponse.end;
-
-  // these lines are necessary and must happen before we do any writing to the response
-  // otherwise the headers will have already been sent
-  delete proxyResponse.headers['content-length'];
-
-  // remove IIS server header for security
-  delete proxyResponse.headers['server'];
-
-  if (config.setHeaders) {
-    config.setHeaders(request, serverResponse, proxyResponse);
-  }
-
-  const contentEncoding = proxyResponse.headers['content-encoding'];
-  if (
-    contentEncoding &&
-    (contentEncoding.indexOf('gzip') !== -1 || contentEncoding.indexOf('deflate') !== -1)
-  ) {
-    delete proxyResponse.headers['content-encoding'];
-  }
-
-  // we are going to set our own status code if transformation fails
-  serverResponse.writeHead = () => {};
-
-  // buffer the response body as it is written for later processing
-  let buf = Buffer.from('');
-  serverResponse.write = (data: any, encoding: any) => {
-    if (Buffer.isBuffer(data)) {
-      buf = Buffer.concat([buf, data]); // append raw buffer
-    } else {
-      buf = Buffer.concat([buf, Buffer.from(data, encoding)]); // append string with optional character encoding (default utf8)
-    }
-
-    // sanity check: if the response is huge, bail.
-    // ...we don't want to let someone bring down the server by filling up all our RAM.
-    if (buf.length > (config.maxResponseSizeBytes as number)) {
-      throw new Error('Document too large');
-    }
-
-    return true;
-  };
-
-  async function extractLayoutServiceDataFromProxyResponse(): Promise<any> {
-    if (proxyResponse.statusCode === 200 || proxyResponse.statusCode === 404) {
-      let responseString: Promise<string>;
-
-      if (
-        contentEncoding &&
-        (contentEncoding.indexOf('gzip') !== -1 || contentEncoding.indexOf('deflate') !== -1)
-      ) {
-        responseString = new Promise((resolve, reject) => {
-          if (config.debug) {
-            console.log('Layout service response is compressed; decompressing.');
-          }
-
-          zlib.unzip(buf, (error, result) => {
-            if (error) {
-              reject(error);
-            }
-
-            if (result) {
-              resolve(result.toString('utf-8'));
-            }
-          });
-        });
-      } else {
-        responseString = Promise.resolve(buf.toString('utf-8'));
-      }
-
-      return responseString.then(tryParseJson);
-    }
-
-    return Promise.resolve(null);
-  }
-
-  // function replies with HTTP 500 when an error occurs
-  async function replyWithError(error: Error) {
-    console.error(error);
-
-    let errorResponse = {
-      statusCode: proxyResponse.statusCode || 500,
-      content: proxyResponse.statusMessage || 'Internal Server Error',
-    };
-
-    if (config.onError) {
-      const onError = await config.onError(error, proxyResponse);
-      errorResponse = { ...errorResponse, ...onError };
-    }
-
-    completeProxyResponse(Buffer.from(errorResponse.content), errorResponse.statusCode, {});
-  }
-
-  function completeProxyResponse(content: Buffer, statusCode: number, headers?: any) {
-    if (!headers) {
-      headers = proxyResponse.headers;
-    }
-
-    originalWriteHead.apply(serverResponse, [statusCode, headers]);
-    originalWrite.call(serverResponse, content);
-    originalEnd.call(serverResponse, undefined);
-  }
-
-  async function transformLayoutServiceData(layoutServiceData: any): Promise<any> {
-    if (config.transformLayoutServiceData) {
-      return await config.transformLayoutServiceData(
-        layoutServiceData,
-        request,
-        serverResponse,
-        proxyResponse
-      );
-    }
-    return layoutServiceData;
-  }
-
-  // as the response is ending, we parse the current response body which is JSON, then
-  // render the app using that JSON, but return HTML to the final response.
-  serverResponse.end = async () => {
-    try {
-      const extractedLayoutServiceData = await extractLayoutServiceDataFromProxyResponse();
-      if (!extractedLayoutServiceData) {
-        throw new Error(
-          `Received invalid response ${proxyResponse.statusCode} ${proxyResponse.statusMessage}`
-        );
-      }
-
-      let layoutServiceData = await transformLayoutServiceData(extractedLayoutServiceData);
-      if (!Buffer.isBuffer(layoutServiceData) && typeof layoutServiceData !== 'string') {
-        layoutServiceData = JSON.stringify(layoutServiceData);
-      }
-
-      // we have to convert back to a buffer so that we can get the *byte count* (rather than character count) of the body
-      const content = Buffer.from(layoutServiceData);
-
-      // setting the content-length header is not absolutely necessary, but is recommended
-      proxyResponse.headers['content-length'] = content.length.toString(10);
-      const finalStatusCode = proxyResponse.statusCode || 200;
-
-      if (config.debug) {
-        console.log(
-          'DEBUG: FINAL response headers for client',
-          JSON.stringify(proxyResponse.headers, null, 2)
-        );
-
-        console.log('DEBUG: FINAL status code for client', finalStatusCode);
-      }
-
-      completeProxyResponse(content, finalStatusCode);
-    } catch (error) {
-      return replyWithError(error);
-    }
-  };
-}
-
-function canTransform(url: string, config: ProxyConfig) {
+function isTransformableLayoutServiceRequest(url: string, config: ProxyConfig) {
   return (
     url.toLowerCase().indexOf(config.layoutServiceRoute.toLowerCase()) !== -1 &&
     config.transformLayoutServiceData
   );
 }
 
+function defaultResponseModifier(
+  proxyResponse: IncomingMessage,
+  request: any,
+  serverResponse: ServerResponse,
+  proxyOptions: proxy.Config
+) {
+  if (!serverResponse.headersSent) {
+    webOutgoingMethods.forEach((method) => {
+      method(request, serverResponse as any, proxyResponse, proxyOptions as any);
+    });
+  }
+}
+
+// Handles the response from the "origin" server, i.e. Sitecore CD server
+// At this point, we're allowed to configure and modify the outgoing response from the Node server.
 function handleProxyResponse(
   proxyResponse: IncomingMessage,
   request: any,
   serverResponse: ServerResponse,
   renderer: AppRenderer,
-  config: ProxyConfig
+  config: ProxyConfig,
+  proxyOptions: proxy.Config
 ) {
   if (config.debug) {
     console.log('DEBUG: request url', request.url);
@@ -453,32 +271,191 @@ function handleProxyResponse(
     );
   }
 
+  const emitter = new EventEmitter();
+
   removeEmptyAnalyticsCookie(proxyResponse);
 
-  // if the request URL contains any of the excluded rewrite routes, we assume the response does not need to be server rendered.
-  // instead, the responase should just be relayed as usual.
-  if (
-    isUrlIgnored(request.originalUrl, config, true) &&
-    !canTransform(request.originalUrl, config)
-  ) {
-    return Promise.resolve(undefined);
-  }
+  // Normally, the proxy module handles a few actions by itself during the response,
+  // e.g. setting the 'connection' header, rewrite cookie domain/path
+  // However, when the `selfHandleResponse` option is true, the proxy module does not
+  // perform those "default" actions.
+  // The workaround is to directly import the "private" methods from the proxy module
+  // and manually invoke them ourselves while handling the proxy response.
+  // related code and issue:
+  // https://github.com/nodejitsu/node-http-proxy/blob/a3fe02d651d05d02d0ced377c22ae8345a2435a4/lib/http-proxy/passes/web-incoming.js#L170
+  // https://github.com/nodejitsu/node-http-proxy/blob/master/lib/http-proxy/passes/web-outgoing.js
+  // https://github.com/nodejitsu/node-http-proxy/issues/1263
+  defaultResponseModifier(proxyResponse, request, serverResponse, proxyOptions);
 
-  // If the request URL contains the layout service endpoint path and
-  // a custom layout service transform function has been defined,
-  // then allow the transform function to fulfill its destiny.
-  if (canTransform(request.originalUrl, config)) {
+  // Listen for the `before-response-write` event, which allows us to invoke developer-provided hooks
+  // without having to pass the `request` object through multiple levels
+  emitter.on('before-response-write', () => {
+    // remove IIS server header for security
+    serverResponse.removeHeader('server');
+
+    // If a custom `setHeaders` function is specified, call it when we're good and ready for it to be called.
+    if (config.setHeaders) {
+      config.setHeaders(request, serverResponse, proxyResponse);
+    }
+
     if (config.debug) {
       console.log(
-        `DEBUG: request is eligible for layout service transformation - ${request.originalUrl}`
+        'DEBUG: FINAL response headers for client',
+        JSON.stringify(serverResponse.getHeaders(), null, 2)
       );
+
+      console.log('DEBUG: FINAL status code for client', serverResponse.statusCode);
     }
-    return transformLayoutServiceResponse(proxyResponse, request, serverResponse, config);
+  });
+
+  // If the request URL contains any of the excluded rewrite routes and
+  // the request is not a layout service request whose response data can be transformed,
+  // we assume the response does not need to be server rendered or transformed.
+  // Instead, the response should just be relayed without additional modification.
+  if (
+    urlShouldNotBeRewritten(request.originalUrl, config, true) &&
+    !isTransformableLayoutServiceRequest(request.originalUrl, config)
+  ) {
+    // give us a chance to do things before the response is written and ended.
+    // note: emit is synchronous and calls listeners synchronously, so any listeners
+    // that are async or perform async operations won't complete before the next tick.
+    emitter.emit('before-response-write');
+    // When http-proxy `selfHandleResponse` is true, we need to pipe the proxy response to the server response.
+    proxyResponse.pipe(serverResponse);
+    // note: you do not need to call serverResponse.end() here.
+    return;
   }
 
-  // your first thought might be: why do we need to render the app here? why not just pass the JSON response to another piece of middleware that will render the app?
-  // the answer: the proxy middleware ends the response and does not "chain"
-  return renderAppToResponse(proxyResponse, request, serverResponse, renderer, config);
+  // buffer the response body as it is written so that we can modify it or use it for rendering
+  const responseDataWriter = { output: Buffer.from('') };
+  proxyResponse.on('data', readResponseBody(responseDataWriter, config));
+
+  // As the response is ending, determine how to handle the response content, e.g. transform it or use it for rendering
+  proxyResponse.on('end', async () => {
+    const contentEncoding = proxyResponse.headers['content-encoding'];
+
+    // extract the "raw" (albeit decoded) JSON data from the response
+    const extractedLayoutServiceData = await extractJsonFromResponseData(
+      responseDataWriter.output,
+      config,
+      proxyResponse.statusCode,
+      contentEncoding
+    );
+    if (!extractedLayoutServiceData) {
+      throw new Error(
+        `Received invalid response ${proxyResponse.statusCode} ${proxyResponse.statusMessage}`
+      );
+    }
+
+    // If the response data is gzip or deflate, assume we've decompressed it for processing/manipulation
+    // and therefore need to remove the `content-encoding` header from the outgoing response because
+    // the outgoing response will not be encoded (at least not by this proxy middleware).
+    // Note: because of the `defaultResponseModifier` method, all the proxy response headers have been
+    // copied to the server response by this point.
+    if (
+      contentEncoding &&
+      (contentEncoding.indexOf('gzip') !== -1 || contentEncoding.indexOf('deflate') !== -1)
+    ) {
+      serverResponse.removeHeader('content-encoding');
+    }
+
+    // If a custom layout service transform function has been defined, we want the function
+    // to fulfill its glorious destiny for both proxied layout service requests and
+    // for requests that will be SSR'd.
+    let layoutServiceData: object | string = extractedLayoutServiceData;
+    if (config.transformLayoutServiceData) {
+      layoutServiceData = await config.transformLayoutServiceData(
+        extractedLayoutServiceData,
+        request,
+        serverResponse,
+        proxyResponse
+      );
+    }
+
+    // If the request URL contains the layout service endpoint path and
+    // a custom layout service transform function has been defined,
+    // then complete the response using the transformed layout service data.
+    if (isTransformableLayoutServiceRequest(request.originalUrl, config)) {
+      if (config.debug) {
+        console.log(
+          `DEBUG: layout service request was transformed, returning transformed data for URL '${
+            request.originalUrl
+          }'`
+        );
+      }
+
+      try {
+        // layoutServiceData is likely an object, and if defined we need to stringify it
+        // before passing to `completeResponse`, which accepts a Buffer or string.
+        // There may be an opportunity for more type-checking here to make it more "robust"
+        // for careless devs, but...
+        layoutServiceData = layoutServiceData ? JSON.stringify(layoutServiceData) : '';
+
+        const finalStatusCode = proxyResponse.statusCode || 200;
+
+        completeResponse(layoutServiceData, finalStatusCode, serverResponse, emitter);
+      } catch (error) {
+        return replyWithError(error, proxyResponse, config, serverResponse, emitter);
+      }
+    }
+
+    // You may be asking: why do we need to render the app here? why not just pass the JSON response
+    // to another piece of middleware that will render the app?
+    // Answer: the proxy middleware ends the response and does not "chain", i.e. call `next()`
+    try {
+      const renderAppResult = await renderApp(
+        layoutServiceData,
+        proxyResponse,
+        request,
+        serverResponse,
+        renderer,
+        config
+      );
+
+      let html = renderAppResult.renderingResult.html;
+
+      // Provide developers with an opportunity to transform the rendered app
+      // html before we complete the response.
+      if (config.transformSSRContent) {
+        html = await config.transformSSRContent(
+          renderAppResult.renderingResult,
+          request,
+          serverResponse
+        );
+      }
+      // in summary, we parsed the proxy response body which is JSON, then
+      // render the app using that JSON, but return HTML to the final response.
+      completeResponse(
+        html,
+        renderAppResult.statusCode,
+        serverResponse,
+        emitter,
+        renderAppResult.headers
+      );
+    } catch (error) {
+      return replyWithError(error, proxyResponse, config, serverResponse, emitter);
+    }
+  });
+}
+
+function readResponseBody(responseDataWriter: { output: Buffer }, config: ProxyConfig) {
+  return (data: any) => {
+    if (Buffer.isBuffer(data)) {
+      responseDataWriter.output = Buffer.concat([responseDataWriter.output, data]); // append raw buffer
+    } else {
+      // blurg... ReadableStream.on('data') does not pass in `encoding` as an argument
+      // to the data handler callback. So if the data chunk is a string, we don't know
+      // the encoding. Probably not that big of a deal if we can _assume_ UTF-8 encoding,
+      // but is that a fair assumption?
+      responseDataWriter.output = Buffer.concat([responseDataWriter.output, Buffer.from(data)]); // append string with optional character encoding (default utf8)
+    }
+
+    // sanity check: if the response is huge, bail.
+    // ...we don't want to let someone bring down the server by filling up all our RAM.
+    if (responseDataWriter.output.length > (config.maxResponseSizeBytes as number)) {
+      throw new Error('Document too large');
+    }
+  };
 }
 
 export function rewriteRequestPath(
@@ -494,7 +471,7 @@ export function rewriteRequestPath(
   const decodedReqPath = decodeURIComponent(reqPath);
 
   // if the request URL contains a path/route that should not be re-written, then just pass it along as-is
-  if (isUrlIgnored(decodedReqPath, config)) {
+  if (urlShouldNotBeRewritten(decodedReqPath, config)) {
     // we do not return the decoded URL because we're using it verbatim - should be encoded.
     return reqPath;
   }
@@ -560,7 +537,11 @@ export function rewriteRequestPath(
   return path;
 }
 
-function isUrlIgnored(originalUrl: string, config: ProxyConfig, noDebug: boolean = false): boolean {
+function urlShouldNotBeRewritten(
+  originalUrl: string,
+  config: ProxyConfig,
+  noDebug: boolean = false
+): boolean {
   if (config.pathRewriteExcludePredicate && config.pathRewriteExcludeRoutes) {
     console.error(
       'ERROR: pathRewriteExcludePredicate and pathRewriteExcludeRoutes were both provided in config. Provide only one.'
@@ -576,14 +557,14 @@ function isUrlIgnored(originalUrl: string, config: ProxyConfig, noDebug: boolean
       (excludedRoute: string) => excludedRoute.length > 0 && matchRoute.startsWith(excludedRoute)
     );
 
-    if (!noDebug && config.debug && result) {
+    if (!noDebug && config.debug && !result) {
       console.log(
-        `DEBUG: URL ${originalUrl} did not match the proxy exclude list, and will be treated as a layout service route to render. Excludes:`,
+        `DEBUG: URL ${originalUrl} did not match the rewrite exclude list, so it will be re-written as a layout service request, which will be sent to the Sitecore server and the response will be treated as a layout service route to render. Excludes:`,
         config.pathRewriteExcludeRoutes
       );
     } else if (!noDebug) {
       console.log(
-        `DEBUG: URL ${originalUrl} matched the proxy exclude list and will be served verbatim as received. Excludes: `,
+        `DEBUG: URL ${originalUrl} matched the rewrite exclude list, so it will be proxied "directly" to the Sitecore server and the response will be served verbatim as received. Excludes: `,
         config.pathRewriteExcludeRoutes
       );
     }
@@ -594,13 +575,13 @@ function isUrlIgnored(originalUrl: string, config: ProxyConfig, noDebug: boolean
   if (config.pathRewriteExcludePredicate) {
     result = config.pathRewriteExcludePredicate(originalUrl);
 
-    if (config.debug && result) {
+    if (config.debug && !result) {
       console.log(
-        `DEBUG: URL ${originalUrl} did not match the proxy exclude function, and will be treated as a layout service route to render.`
+        `DEBUG: URL ${originalUrl} did not match the rewrite exclude function, so it will be re-written as a layout service request, which will be sent to the Sitecore server and the response will be treated as a layout service route to render..`
       );
     } else {
       console.log(
-        `DEBUG: URL ${originalUrl} matched the proxy exclude function and will be served verbatim as received.`
+        `DEBUG: URL ${originalUrl} matched the rewrite exclude function, so it will be proxied "directly" to the Sitecore server and the response will be served verbatim as received..`
       );
     }
 
@@ -630,15 +611,20 @@ function createOptions(
     console.log('DEBUG: Final proxy config', config);
   }
 
-  return {
+  const options: proxy.Config = {
     target: config.apiHost,
     changeOrigin: true, // required otherwise need to include CORS headers
     ws: true,
     pathRewrite: (reqPath, req) => rewriteRequestPath(reqPath, req, config, parseRouteUrl),
     logLevel: config.debug ? 'debug' : 'info',
-    onProxyRes: (proxyRes, req, res) => handleProxyResponse(proxyRes, req, res, renderer, config),
+    selfHandleResponse: true,
     ...config.proxyOptions,
   };
+
+  options.onProxyRes = (proxyRes, req, res) =>
+    handleProxyResponse(proxyRes, req, res, renderer, config, options);
+
+  return options;
 }
 
 export default function scProxy(
