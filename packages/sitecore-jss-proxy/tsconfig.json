@@ -18,7 +18,13 @@
     "declaration": true,
     "declarationDir": "./types",
     "allowSyntheticDefaultImports": true,
-    "esModuleInterop": true
+    "esModuleInterop": true,
+    // `paths` definition is needed to make `ts-node` happy for testing
+    // `baseUrl` is needed in order for `paths` to work.
+    "baseUrl": ".",
+    "paths": {
+      "http-proxy/lib/http-proxy/passes/web-outgoing": ["src/customTypes/http-proxy"]
+    }
   },
   "exclude": ["node_modules", "types", "dist", "src/**/*.test.ts", "src/testData/*.ts"]
 }
