@@ -9,7 +9,7 @@ describe('tryParseJson', () => {
   });
 
   it('should return false when the string is not json', () => {
-    expect(tryParseJson('<html />')).to.be.null;
+    expect(tryParseJson('<html />')).to.equal(null);
   });
 });
 

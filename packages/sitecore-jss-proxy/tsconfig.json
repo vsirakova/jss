@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "target": "es5",
+    "target": "es2017",
     "module": "commonjs",
     "newLine": "LF",
     "emitDecoratorMetadata": true,
@@ -23,7 +23,8 @@
     // `baseUrl` is needed in order for `paths` to work.
     "baseUrl": ".",
     "paths": {
-      "http-proxy/lib/http-proxy/passes/web-outgoing": ["src/customTypes/http-proxy"]
+      "http-proxy/lib/http-proxy/passes/web-outgoing": ["src/customTypes/http-proxy"],
+      "mock-res": ["src/customTypes/mock-res"]
     }
   },
   "exclude": ["node_modules", "types", "dist", "src/**/*.test.ts", "src/testData/*.ts"]

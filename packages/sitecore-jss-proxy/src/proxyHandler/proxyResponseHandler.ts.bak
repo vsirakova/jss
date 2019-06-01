@@ -1,0 +1,179 @@
+import { IncomingMessage, ServerResponse } from 'http';
+import proxy from 'http-proxy-middleware';
+import webOutgoing from 'http-proxy/lib/http-proxy/passes/web-outgoing';
+import setCookieParser from 'set-cookie-parser';
+import { AppRenderer } from '../AppRenderer';
+import { Logger } from '../Logger';
+import { ProxyConfig } from '../ProxyConfig';
+import { defaultLayoutServiceResponseHandler } from './defaultLayoutServiceResponseHandler';
+import { urlShouldNotBeRewritten } from './requestPathRewriter';
+
+// tslint:disable:max-line-length
+
+// Get all functions exported by the `web-outgoing` module.
+const httpProxyWebOutgoingMethods = Object.values(webOutgoing);
+
+// Handles the response from the "origin" server, i.e. Sitecore CD server
+// At this point, we're allowed to configure and modify the outgoing response from the Node server.
+export function handleProxyResponse(
+  proxyResponse: IncomingMessage,
+  request: any,
+  serverResponse: ServerResponse,
+  renderer: AppRenderer,
+  config: ProxyConfig,
+  proxyOptions: proxy.Config,
+  logger: Logger
+) {
+  logger.log('DEBUG', 'request url', request.url);
+  logger.log('DEBUG', 'request query', request.query);
+  logger.log('DEBUG', 'request original url', request.originalUrl);
+  logger.log('DEBUG', 'proxied request response code', proxyResponse.statusCode);
+  logger.log('DEBUG', 'RAW request headers', JSON.stringify(request.headers, null, 2));
+  // prettier-ignore
+  logger.log('DEBUG', 'RAW headers from the proxied response', JSON.stringify(proxyResponse.headers, null, 2));
+
+  // No, I don't want no scrubs.
+  removeEmptyAnalyticsCookie(proxyResponse);
+
+  // Normally, the proxy module handles a few actions by itself during the response,
+  // e.g. setting the 'connection' header, rewrite cookie domain/path, copying headers.
+  // However, when the `selfHandleResponse` option is true, the proxy module does not
+  // perform those "default" actions.
+  // The workaround is to directly import the "private" methods from the proxy module
+  // and manually invoke them ourselves while handling the proxy response.
+  // related code and issue:
+  // https://github.com/nodejitsu/node-http-proxy/blob/a3fe02d651d05d02d0ced377c22ae8345a2435a4/lib/http-proxy/passes/web-incoming.js#L170
+  // https://github.com/nodejitsu/node-http-proxy/blob/master/lib/http-proxy/passes/web-outgoing.js
+  // https://github.com/nodejitsu/node-http-proxy/issues/1263
+  // prettier-ignore
+  defaultResponseModifier(httpProxyWebOutgoingMethods, request, serverResponse, proxyResponse, proxyOptions);
+
+  const readonlyProxyResponse = convertResponseToReadonlyResponse<ReadonlyProxyResponse>(
+    proxyResponse
+  );
+
+  // If the request URL contains any of the excluded rewrite routes and
+  // the request is not a layout service request whose response data can be transformed,
+  // we assume the response does not need to be server rendered or transformed.
+  // Instead, the response should just be piped. Though we can still modify the serverResponse before it is sent.
+  // A few notes:
+  // * `defaultResponseModifier` copies headers from `proxyResponse` to `serverResponse`.
+  // * `proxyResponse.pipe` does _not_ pipe headers from `proxyResponse` to `serverResponse`, it only pipes the response body.
+  //    So header changes can be made to serverResponse without being overwritten.
+  if (isPipeableResponse(request, config)) {
+    // give us a chance to do things before the response is written and ended.
+    finalizeServerResponse(serverResponse, readonlyProxyResponse, request, config, logger);
+    // When http-proxy `selfHandleResponse` is true, we need to pipe the proxy response to the server response.
+    proxyResponse.pipe(serverResponse);
+    // note: you do not need to call serverResponse.end() here.
+    return;
+  }
+
+  // If we make it here, we can assume the request to the proxy was a layout service request.
+  defaultLayoutServiceResponseHandler(
+    proxyResponse,
+    serverResponse,
+    request,
+    config,
+    logger,
+    renderer
+  );
+}
+
+export function isPipeableResponse(request: any, config: ProxyConfig) {
+  return (
+    urlShouldNotBeRewritten(request.originalUrl, config) &&
+    !isTransformableLayoutServiceRequest(request.originalUrl, config)
+  );
+}
+
+// These actions are common to _all_ responses, both pipeable and non-pipeable
+export function finalizeServerResponse(
+  serverResponse: ServerResponse,
+  readonlyProxyResponse: ReadonlyProxyResponse,
+  request: any,
+  config: ProxyConfig,
+  logger: Logger
+) {
+  // remove IIS server header for security
+  serverResponse.removeHeader('server');
+
+  // If a custom `setHeaders` function is specified, call it when we're good and ready for it to be called.
+  // Technically, this could be used to modify any property in the serverResponse prior to
+  // the response being sent.
+  // Perhaps we should change the function name?
+  // Also, we probably don't need to pass the proxy response. Unless devs would possibly want to compare
+  // the proxy response to the server response?
+  if (config.setHeaders) {
+    config.setHeaders(request, serverResponse, readonlyProxyResponse);
+  }
+
+  // prettier-ignore
+  logger.log('DEBUG', 'FINAL response headers for client', JSON.stringify(serverResponse.getHeaders(), null, 2));
+  logger.log('DEBUG', 'FINAL status code for client', serverResponse.statusCode);
+}
+
+export function defaultResponseModifier(
+  webOutgoingMethods: any[],
+  request: any,
+  serverResponse: ServerResponse,
+  proxyResponse: IncomingMessage,
+  proxyOptions: proxy.Config
+) {
+  if (!serverResponse.headersSent) {
+    // It is expected that the webOutgoingMethods largely share the same
+    // signature, so instead of calling each method by name, we can
+    // iterate the array of methods and invoke them "generically".
+    webOutgoingMethods.forEach((method) => {
+      method(request, serverResponse as any, proxyResponse, proxyOptions as any);
+    });
+  }
+}
+
+export function isTransformableLayoutServiceRequest(url: string, config: ProxyConfig) {
+  // if the provided URL contains the defined layout service route and a transform
+  // function is provided, then the response data is eligible for transformation.
+  return (
+    url.toLowerCase().indexOf(config.layoutServiceRoute.toLowerCase()) !== -1 &&
+    typeof config.transformLayoutServiceData === 'function'
+  );
+}
+
+export function convertResponseToReadonlyResponse<T>(
+  response: any,
+  onBeforeFreeze?: (convertedResponse: any) => void
+) {
+  const readonlyResponse = Object.keys(response).reduce((result: any, key: string) => {
+    if (typeof response[key] !== 'function') {
+      result[key] = response[key];
+    }
+    return result;
+  }, {});
+
+  if (onBeforeFreeze) {
+    onBeforeFreeze(readonlyResponse);
+  }
+
+  return Object.freeze(readonlyResponse as T);
+}
+
+// For some reason, every other response returned by Sitecore contains the 'set-cookie' header with the SC_ANALYTICS_GLOBAL_COOKIE value as an empty string.
+// This effectively sets the cookie to empty on the client as well, so if a user were to close their browser
+// after one of these 'empty value' responses, they would not be tracked as a returning visitor after re-opening their browser.
+// To address this, we simply parse the response cookies and if the analytics cookie is present but has an empty value, then we
+// remove it from the response header. This means the existing cookie in the browser remains intact.
+export const removeEmptyAnalyticsCookie = (proxyResponse: any) => {
+  const cookies = setCookieParser.parse(proxyResponse.headers['set-cookie']);
+  if (cookies) {
+    const analyticsCookieIndex = cookies.findIndex(
+      (c: any) => c.name === 'SC_ANALYTICS_GLOBAL_COOKIE'
+    );
+    if (analyticsCookieIndex !== -1) {
+      const analyticsCookie = cookies[analyticsCookieIndex];
+      if (analyticsCookie && analyticsCookie.value === '') {
+        cookies.splice(analyticsCookieIndex, 1);
+        proxyResponse.headers['set-cookie'] = cookies;
+      }
+    }
+  }
+};

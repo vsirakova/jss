@@ -9,7 +9,7 @@ const dictionaryCache = new NodeCache({ stdTTL: 60 });
 /**
  * The server.bundle.js file from your pre-built JSS app
  */
-const bundlePath = process.env.SITECORE_JSS_SERVER_BUNDLE || './dist/yourappname/server.bundle';
+const bundlePath = process.env.SITECORE_JSS_SERVER_BUNDLE || './dist/react-qa/server.bundle';
 const serverBundle = require(bundlePath);
 
 /**
@@ -25,7 +25,7 @@ const config = {
    * Should be https for production. Must be https to use SSC auth service,
    * if supporting Sitecore authentication.
    */
-  apiHost: process.env.SITECORE_API_HOST || 'http://my.sitecore.host',
+  apiHost: process.env.SITECORE_API_HOST || 'http://jssreactweb',
   /**
    * layoutServiceRoot: The path to layout service for the JSS application.
    * Some apps, like advanced samples, use a custom LS configuration,
@@ -37,7 +37,8 @@ const config = {
    * apiKey: The Sitecore SSC API key your app uses.
    * Required.
    */
-  apiKey: process.env.SITECORE_API_KEY || serverBundle.apiKey || '{YOUR API KEY HERE}',
+  apiKey:
+    process.env.SITECORE_API_KEY || serverBundle.apiKey || '{3A76F728-74E0-43B6-BAA1-B5814A07AE20}',
   /**
    * pathRewriteExcludeRoutes: A list of absolute paths
    * that are NOT app routes and should not attempt to render a route
@@ -62,7 +63,7 @@ const config = {
    * Writes verbose request info to stdout for debugging.
    * Must be disabled in production for reasonable performance.
    */
-  debug: process.env.SITECORE_ENABLE_DEBUG || false,
+  debug: process.env.SITECORE_ENABLE_DEBUG || true,
   /**
    * Maximum allowed proxy reply size in bytes. Replies larger than this are not sent.
    * Avoids starving the proxy of memory if large requests are proxied.
@@ -137,7 +138,7 @@ const config = {
     if (cached) return Promise.resolve(cached);
 
     return fetch(
-      `${config.apiHost}/sitecore/api/jss/dictionary/JssReactWeb/${language}?sc_apikey=${
+      `${config.apiHost}/sitecore/api/jss/dictionary/react-qa/${language}?sc_apikey=${
         config.apiKey
       }`
     )
