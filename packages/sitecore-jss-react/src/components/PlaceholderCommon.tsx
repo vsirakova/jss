@@ -1,17 +1,21 @@
-import React from 'react';
+import React, { ComponentType } from 'react';
 import PropTypes, { Requireable } from 'prop-types';
 import { MissingComponent } from '../components/MissingComponent';
 import { ComponentFactory } from '../components/sharedTypes';
-import { ComponentRendering, RouteData, Field, Item, HtmlElementRendering } from '@sitecore-jss/sitecore-jss';
+import {
+  ComponentRendering,
+  RouteData,
+  Field,
+  Item,
+  HtmlElementRendering,
+} from '@sitecore-jss/sitecore-jss';
 import { convertAttributesToReactProps } from '../utils';
 
 export interface PlaceholderProps {
   /** Name of the placeholder to render. */
   name: string;
   /** Rendering data to be used when rendering the placeholder. */
-  rendering:
-  | ComponentRendering
-  | RouteData;
+  rendering: ComponentRendering | RouteData;
   /**
    * A factory function that will receive a componentName and return an instance of a React component.
    * When rendered within a <SitecoreContext> component, defaults to the context componentFactory.
@@ -22,9 +26,7 @@ export interface PlaceholderProps {
    * Any component or placeholder rendered by a placeholder will have access to this data via `props.fields`.
    */
   fields?: {
-    [name: string]:
-    | Field
-    | Item[];
+    [name: string]: Field | Item[];
   };
   /**
    * An object of rendering parameter names/values that are aggregated and propagated through the component tree created by a placeholder.
@@ -53,27 +55,32 @@ export class PlaceholderCommon<T extends PlaceholderProps> extends React.Compone
   static propTypes = {
     rendering: PropTypes.oneOfType([
       PropTypes.object as Requireable<RouteData>,
-      PropTypes.object as Requireable<ComponentRendering>
+      PropTypes.object as Requireable<ComponentRendering>,
     ]).isRequired,
-    fields: PropTypes.objectOf(PropTypes.oneOfType([
-      PropTypes.object as Requireable<Field>,
-      PropTypes.object as Requireable<Item[]>
-    ]).isRequired),
+    fields: PropTypes.objectOf(
+      PropTypes.oneOfType([
+        PropTypes.object as Requireable<Field>,
+        PropTypes.object as Requireable<Item[]>,
+      ]).isRequired
+    ),
     params: PropTypes.objectOf(PropTypes.string.isRequired),
     missingComponentComponent: PropTypes.oneOfType([
       PropTypes.object as Requireable<React.ComponentClass<any>>,
-      PropTypes.object as Requireable<React.SFC<any>>
+      PropTypes.object as Requireable<React.SFC<any>>,
     ]),
     errorComponent: PropTypes.oneOfType([
       PropTypes.object as Requireable<React.ComponentClass<any>>,
-      PropTypes.object as Requireable<React.SFC<any>>
+      PropTypes.object as Requireable<React.SFC<any>>,
     ]),
   };
 
   nodeRefs: any[];
   state: Readonly<{ error?: Error }>;
 
-  static getPlaceholderDataFromRenderingData(rendering: ComponentRendering | RouteData, name: string) {
+  static getPlaceholderDataFromRenderingData(
+    rendering: ComponentRendering | RouteData,
+    name: string
+  ) {
     let result;
     if (rendering && rendering.placeholders && Object.keys(rendering.placeholders).length > 0) {
       result = rendering.placeholders[name];
@@ -123,40 +130,39 @@ export class PlaceholderCommon<T extends PlaceholderProps> extends React.Compone
       ...placeholderProps
     } = this.props;
 
-    return placeholderData.map((rendering: any, index: number) => {
-      const key = rendering.uid ? rendering.uid : `component-${index}`;
-      const commonProps = { key };
+    return placeholderData
+      .map((rendering: any, index: number) => {
+        const key = rendering.uid ? rendering.uid : `component-${index}`;
+        const commonProps = { key };
 
-      // if the element is not a 'component rendering', render it 'raw'
-      if (!rendering.componentName && rendering.name) {
-        return this.createRawElement(rendering, commonProps);
-      }
+        // if the element is not a 'component rendering', render it 'raw'
+        if (!rendering.componentName && rendering.name) {
+          return this.createRawElement(rendering, commonProps);
+        }
 
-      let component: React.ReactNode | null = this.getComponentForRendering(rendering);
-      if (!component) {
-        console.error(
-          `Placeholder ${name} contains unknown component ${
-          rendering.componentName
-          }. Ensure that a React component exists for it, and that it is registered in your componentFactory.js.`
-        );
+        let component: ComponentType | null = this.getComponentForRendering(rendering);
+        if (!component) {
+          console.error(
+            `Placeholder ${name} contains unknown component ${rendering.componentName}. Ensure that a React component exists for it, and that it is registered in your componentFactory.js.`
+          );
 
-        component = missingComponentComponent || MissingComponent;
-      }
+          component = missingComponentComponent ?? MissingComponent;
+        }
 
-      const finalProps = {
-        ...commonProps,
-        ...placeholderProps,
-        ...((placeholderFields || rendering.fields) && {
-          fields: { ...placeholderFields, ...rendering.fields },
-        }),
-        ...((placeholderParams || rendering.params) && {
-          params: { ...placeholderParams, ...rendering.params },
-        }),
-        rendering,
-      };
+        const finalProps = {
+          ...commonProps,
+          ...placeholderProps,
+          ...((placeholderFields || rendering.fields) && {
+            fields: { ...placeholderFields, ...rendering.fields },
+          }),
+          ...((placeholderParams || rendering.params) && {
+            params: { ...placeholderParams, ...rendering.params },
+          }),
+          rendering,
+        };
 
-      return React.createElement(component as any, finalProps);
-    })
+        return React.createElement(component as any, finalProps);
+      })
       .filter((element: any) => element); // remove nulls
   }
 
@@ -164,7 +170,9 @@ export class PlaceholderCommon<T extends PlaceholderProps> extends React.Compone
     const componentFactory = this.props.componentFactory;
 
     if (!componentFactory || typeof componentFactory !== 'function') {
-      console.warn(`No componentFactory was available to service request for component ${renderingDefinition}`);
+      console.warn(
+        `No componentFactory was available to service request for component ${renderingDefinition}`
+      );
       return null;
     }
 

@@ -12,10 +12,10 @@ import {
 import { convertedData as eeData } from '../testData/ee-data';
 
 const componentFactory: ComponentFactory = (componentName: string) => {
-  const components = new Map<string, any>();
+  const components = new Map<string, React.FC>();
 
   // pass otherProps to page-content to test property cascading through the Placeholder
-  const Home: React.SFC<any> = ({ rendering, render, renderEach, renderEmpty, ...otherProps }) => (
+  const Home: React.FC<any> = ({ rendering, render, renderEach, renderEmpty, ...otherProps }) => (
     <div className="home-mock">
       <Placeholder name="page-header" rendering={rendering} />
       <Placeholder name="page-content" rendering={rendering} {...otherProps} />
@@ -27,7 +27,7 @@ const componentFactory: ComponentFactory = (componentName: string) => {
 
   components.set('Home', Home);
 
-  const DownloadCallout: React.SFC<any> = (props) => (
+  const DownloadCallout: React.FC<any> = (props) => (
     <div className="download-callout-mock">
       {props.fields.message ? props.fields.message.value : ''}
     </div>
@@ -126,23 +126,21 @@ describe('<Placeholder />', () => {
 
           const renderedComponent = mount(
             <SitecoreContext componentFactory={componentFactory}>
-              <Placeholder
-                name={phKey}
-                rendering={component}
-                render={() => null}
-              />
+              <Placeholder name={phKey} rendering={component} render={() => null} />
             </SitecoreContext>
           );
 
-          const placeholder = renderedComponent.find(Placeholder)
+          const placeholder = renderedComponent.find(Placeholder);
           expect(placeholder.length).to.equal(1);
           expect(placeholder.children()).to.be.empty;
         });
-      })
+      });
 
       it('should render output based on the renderEmpty function in case of no renderings', () => {
         let component: any = dataSet.data.sitecore.route;
-        const renderings = component.placeholders.main.filter(({ componentName }: any) => !componentName);
+        const renderings = component.placeholders.main.filter(
+          ({ componentName }: any) => !componentName
+        );
         const myComponent = {
           ...component,
           placeholders: {
@@ -172,8 +170,8 @@ describe('<Placeholder />', () => {
       it('should pass properties to nested components', () => {
         const component = dataSet.data.sitecore.route as any;
         const phKey = 'main';
-        const expectedMessage = (component.placeholders.main as any[]).find((c) => c.componentName).fields
-          .message;
+        const expectedMessage = (component.placeholders.main as any[]).find((c) => c.componentName)
+          .fields.message;
 
         const renderedComponent = mount(
           <SitecoreContext componentFactory={componentFactory}>
@@ -212,7 +210,7 @@ describe('<Placeholder />', () => {
       placeholders: {
         main: [
           {
-            componentName: 'Home'
+            componentName: 'Home',
           },
         ],
       },
